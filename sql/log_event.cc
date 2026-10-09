@@ -8397,6 +8397,55 @@ static uint search_key_in_table(TABLE *table, MY_BITMAP *bi_cols,
   return res;
 }
 
+/**
+  Checks whether applying the rows of an Update_rows event in an order
+  different from the event order can transiently violate a unique
+  constraint on the replica.
+
+  This happens when an after-image reuses a unique key value that is still
+  held by the before-image of a row that comes later in the scan order
+  (unique key rotation, e.g. UPDATE t SET uk = uk + N). The source applied
+  the rows in an order that avoids the conflict, and that order is the
+  event order.
+
+  @param table    the table being updated
+  @param ai_cols  local bitmap of the columns present in the after-image
+
+  @retval true  some unique key may get new values from the after-image
+  @retval false no unique key can be affected by the after-image
+*/
+static bool update_may_conflict_on_unique_key(const TABLE *table,
+                                              const MY_BITMAP *ai_cols) {
+  DBUG_TRACE;
+
+  for (uint key = 0; key < table->s->keys; key++) {
+    const KEY *keyinfo = table->key_info + key;
+
+    /* Only unique constraints can be violated by a duplicate key value. */
+    if (!(keyinfo->flags & HA_NOSAME)) continue;
+
+    for (uint i = 0; i < keyinfo->user_defined_key_parts; i++) {
+      const Field *field = keyinfo->key_part[i].field;
+
+      /* Be conservative if the key part cannot be inspected. */
+      if (field == nullptr) return true;
+
+      /*
+        Generated columns (functional / multi-valued indexes) are not
+        replicated directly; their value depends on base columns, so
+        assume they may change.
+      */
+      if (field->is_gcol()) return true;
+
+      const uint field_index = field->field_index();
+      if (field_index < ai_cols->n_bits && bitmap_is_set(ai_cols, field_index))
+        return true;
+    }
+  }
+
+  return false;
+}
+
 void Rows_log_event::decide_row_lookup_algorithm_and_key() {
   DBUG_TRACE;
 
@@ -8405,6 +8454,10 @@ void Rows_log_event::decide_row_lookup_algorithm_and_key() {
     2. Otherwise, if there is any other index, use index hash scan
     3. Otherwise, use table hash scan.
     4. If the engine does not support hash scans, use table scan.
+    5. If an Update_rows event may transiently violate a unique constraint
+       (an after-image reuses a unique key value that is still held by the
+       before-image of another row), use index scan if possible, or table
+       scan otherwise, so that the rows are applied in event order.
   */
   TABLE *table = this->m_table;
   uint event_type = this->get_general_type_code();
@@ -8424,6 +8477,27 @@ void Rows_log_event::decide_row_lookup_algorithm_and_key() {
     DBUG_PRINT("info",
                ("decide_row_lookup_algorithm_and_key: decided - INDEX_SCAN"));
     this->m_rows_lookup_algorithm = ROW_LOOKUP_INDEX_SCAN;
+    goto end;
+  }
+
+  /*
+    HASH_SCAN applies rows in the order of the lookup key (or of the
+    clustered index), not in the event order. If the table has a unique
+    constraint that the after-image may modify, applying rows out of order
+    can hit a duplicate key error that never happened on the source
+    (unique key rotation). Apply such Update_rows events row by row, in
+    event order, using an index if possible, or a table scan otherwise.
+  */
+  if (event_type == mysql::binlog::event::UPDATE_ROWS_EVENT &&
+      update_may_conflict_on_unique_key(table, &this->m_local_cols_ai)) {
+    this->m_key_index = search_key_in_table(
+        table, cols, (PRI_KEY_FLAG | UNIQUE_KEY_FLAG | MULTIPLE_KEY_FLAG));
+    this->m_rows_lookup_algorithm = (this->m_key_index < MAX_KEY)
+                                        ? ROW_LOOKUP_INDEX_SCAN
+                                        : ROW_LOOKUP_TABLE_SCAN;
+    DBUG_PRINT("info", ("decide_row_lookup_algorithm_and_key: unique key may "
+                        "conflict out of order - %s",
+                        m_key_index < MAX_KEY ? "INDEX_SCAN" : "TABLE_SCAN"));
     goto end;
   }
 
